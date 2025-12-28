@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dust Interface — Split Gather + Handwriting Fade</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+  <style>
+    html,body{margin:0;height:100%;background:#05060a;overflow:hidden;}
+    .hint{
+      position:fixed;left:12px;bottom:12px;
+      color:rgba(255,255,255,.6);font:14px/1.4 system-ui;user-select:none;
+    }
+  </style>
+</head>
+<body>
+<div class="hint">
+  Type to disturb the space. Some particles gather, some hesitate, others remain. 
+  Text fades as it is written.
+</div>
+
+
+<script>
+/** =========================
+ *  可调参数（只改这里就行）
+ *  ========================= */
+const TEXT_LIFE_FRAMES = 180; // 每个字符寿命（180≈3秒@60fps）
+const TEXT_FADE_FRAMES = 80;  // 每个字符淡出时长（越大越丝滑）
+
+// 粒子分组比例：Fast/Slow/Idle
+const RATIO_FAST = 0.30;
+const RATIO_SLOW = 0.40;
+const RATIO_IDLE = 0.30;
+
+// 文字点采样密度（越小越清晰但更吃性能）
+const SAMPLE_STEP_SHORT = 7;
+const SAMPLE_STEP_LONG  = 8;
+
+// 输入触发强度（越大越“明显”）
+const FIELD_BOOST_PER_KEY = 0.24;
+// 触发衰减（越接近1衰减越慢）
+const FIELD_DECAY = 0.972;
+
+/** =========================
+ *  全局变量
+ *  ========================= */
+let motes = [];
+let field = 0;
+
+let pg, targets = [];
+let lastRenderedText = "";
+let needsResample = true;
+
+// “手写输入法式”逐字消失：存字符与出生帧
+let chars = []; // {ch, born}
+
+/** =========================
+ *  生命周期
+ *  ========================= */
+function setup(){
+  createCanvas(windowWidth, windowHeight);
+  pg = createGraphics(windowWidth, windowHeight);
+  pg.pixelDensity(1);
+
+  // 三层景深：远/中/近
+  spawnLayer(0, 900);
+  spawnLayer(1, 520);
+  spawnLayer(2, 240);
+
+  noStroke();
+  resampleTargets(getLiveText());
+}
+
+function windowResized(){
+  resizeCanvas(windowWidth, windowHeight);
+  pg = createGraphics(windowWidth, windowHeight);
+  pg.pixelDensity(1);
+  needsResample = true;
+}
+
+function spawnLayer(layer, count){
+  for(let i=0;i<count;i++) motes.push(new Mote(motes.length, layer));
+}
+
+function keyPressed(){
+  if(keyCode === ENTER){
+    chars = [];
+    field = 0;
+    needsResample = true;
+    return;
+  }
+  if(keyCode === BACKSPACE){
+    chars.pop();
+    needsResample = true;
+    // 删除也算互动
+    field = min(1, field + FIELD_BOOST_PER_KEY*0.6);
+    return;
+  }
+}
+
+function keyTyped(){
+  if(key.length === 1 && key !== "\n"){
+    chars.push({ ch: key, born: frameCount });
+    field = min(1, field + FIELD_BOOST_PER_KEY);
+    needsResample = true;
+  }
+}
+
+function draw(){
+  // ✅ 无尾巴：完全清屏
+  background(5,6,10);
+
+  // 触发强度衰减：输入停止后慢慢回到“漫游”
+  field *= FIELD_DECAY;
+
+  // 更新当前可见文本（会自动清理寿命到期字符）
+  const liveText = getLiveText();
+
+  // 因为字符会“自己消失”，所以即使不按键也可能文本变化：需要重采样
+  if(liveText !== lastRenderedText){
+    needsResample = true;
+    lastRenderedText = liveText;
+  }
+
+  if(needsResample){
+    resampleTargets(liveText);
+    needsResample = false;
+  }
+
+  // 画字：逐字淡出（边写边消失）
+  drawHandwritingText();
+
+  // 更新&渲染尘埃
+  for(const m of motes){
+    m.step();
+    m.show();
+  }
+}
+
+/** =========================
+ *  文字：逐字寿命 + 淡出
+ *  ========================= */
+function getLiveText(){
+  // 清理掉寿命到期的字符
+  chars = chars.filter(c => (frameCount - c.born) < TEXT_LIFE_FRAMES);
+  return chars.map(c => c.ch).join("");
+}
+
+// 逐字绘制：旧字先淡，像手机手写输入法“边写边消失”
+function drawHandwritingText(){
+  const live = getLiveText();
+  if(!live.trim()) return;
+
+  push();
+  textAlign(LEFT, CENTER);
+  textSize(min(56, width*0.075));
+
+  // 计算整行宽度，用于整体居中
+  let totalW = 0;
+  for(const c of chars) totalW += textWidth(c.ch);
+  let cursorX = width/2 - totalW/2;
+  const y = height/2;
+
+  // “更像墨迹蒸发”：轻微柔化的最低可见度
+  for(const c of chars){
+    const age = frameCount - c.born;
+
+    let a;
+    if(age < TEXT_LIFE_FRAMES - TEXT_FADE_FRAMES){
+      a = 120; // 新字阶段清晰可见
+    }else{
+      const t = (TEXT_LIFE_FRAMES - age) / TEXT_FADE_FRAMES; // 1 -> 0
+      a = 120 * constrain(t, 0, 1);
+    }
+
+    // 让“新字更亮，旧字更弱”，更像手写输入法
+    const freshness = 1 - (age / TEXT_LIFE_FRAMES);
+    a *= (0.55 + 0.60*freshness);
+
+    fill(255, a);
+    text(c.ch, cursorX, y);
+    cursorX += textWidth(c.ch);
+  }
+  pop();
+}
+
+/** =========================
+ *  文字形状采样（粒子聚拢目标）
+ *  ========================= */
+function resampleTargets(txt){
+  targets = [];
+
+  pg.clear();
+  pg.background(0,0);
+  pg.textAlign(CENTER, CENTER);
+
+  const ts = min(130, max(44, width*0.12));
+  pg.textSize(ts);
+  pg.fill(255);
+  pg.noStroke();
+  pg.text((txt && txt.trim()) ? txt : " ", pg.width/2, pg.height/2);
+
+  pg.loadPixels();
+
+  const step = (txt.length > 12) ? SAMPLE_STEP_LONG : SAMPLE_STEP_SHORT;
+  for(let y=0; y<pg.height; y+=step){
+    for(let x=0; x<pg.width; x+=step){
+      const idx = 4*(y*pg.width + x);
+      const a = pg.pixels[idx+3];
+      if(a > 10){
+        if(random() < 0.55) targets.push({x,y});
+      }
+    }
+  }
+  if(!txt.trim()) targets = [];
+}
+
+/** =========================
+ *  尘埃粒子类（带远近层次 + 分组互动强弱）
+ *  ========================= */
+class Mote{
+  constructor(i, layer){
+    this.i = i;
+    this.layer = layer; // 0 far, 1 mid, 2 near
+    this.p = createVector(random(width), random(height));
+    this.seed = random(1000);
+    this.flickerPhase = random(TWO_PI);
+
+    // 分组：Fast / Slow / Idle（互动时表现不同）
+    const r = random();
+    if(r < RATIO_FAST) this.group = "fast";
+    else if(r < RATIO_FAST + RATIO_SLOW) this.group = "slow";
+    else this.group = "idle";
+
+    // 层参数（景深）：远更慢更暗更小；近更亮更大
+    const preset = [
+      { r:[0.6, 1.3], v:[0.03, 0.18], baseA:[8,  24],  pulseK:0.70, gatherBase:0.55 },
+      { r:[0.9, 1.8], v:[0.05, 0.28], baseA:[14, 38],  pulseK:1.00, gatherBase:1.00 },
+      { r:[1.2, 2.6], v:[0.08, 0.40], baseA:[24, 58],  pulseK:1.25, gatherBase:1.18 }
+    ][layer];
+
+    this.r0 = random(preset.r[0], preset.r[1]);
+    this.v  = p5.Vector.random2D().mult(random(preset.v[0], preset.v[1]));
+    this.baseA0 = preset.baseA[0];
+    this.baseA1 = preset.baseA[1];
+    this.pulseK = preset.pulseK;
+
+    // 目标偏移：避免“排队成字”，保持尘埃感
+    const off = (layer===2) ? 18 : (layer===1 ? 24 : 30);
+    this.targetOffset = createVector(random(-off,off), random(-off,off));
+
+    // 闪烁基础频率：近景略快
+    this.flickerRateBase = random(0.0035, 0.010) + layer*0.0012;
+
+    // 聚拢强度：按层 + 分组
+    // fast > slow > idle(不聚)
+    const g = preset.gatherBase;
+    this.gatherK =
+      this.group === "fast" ? 1.9*g :
+      this.group === "slow" ? 0.95*g :
+      0;
+
+    // 聚拢时速度上限（fast 更快）
+    this.gatherSpeedLimit =
+      this.group === "fast" ? (layer===0 ? 1.55 : layer===1 ? 1.95 : 2.35) :
+      this.group === "slow" ? (layer===0 ? 0.85 : layer===1 ? 1.10 : 1.35) :
+      (layer===0 ? 0.42 : layer===1 ? 0.62 : 0.82); // idle 维持漫游上限
+  }
+
+  idleDrift(){
+    // 空气漂移：远景更平缓
+    const scale = (this.layer===0) ? 0.00125 : (this.layer===1 ? 0.0016 : 0.0019);
+    const speedZ = (this.layer===0) ? 0.0010 : (this.layer===1 ? 0.0013 : 0.0016);
+
+    const n = noise(this.p.x*scale, this.p.y*scale, frameCount*speedZ + this.seed);
+    const ang = n * TWO_PI * 2.6;
+    const drift = createVector(cos(ang), sin(ang)).mult(0.018 + 0.004*this.layer);
+    const micro = p5.Vector.random2D().mult(0.008 + 0.004*this.layer);
+
+    this.v.add(drift).add(micro);
+
+    // 漫游速度上限（保持“尘埃慢飘”）
+    const lim = (this.layer===0) ? 0.42 : (this.layer===1 ? 0.62 : 0.82);
+    this.v.limit(lim);
+  }
+
+  gatherToText(){
+    // 只在互动强度足够时聚拢，且 idle 组不聚
+    if(this.gatherK <= 0) return;
+    if(field < 0.03 || targets.length === 0) return;
+
+    // 每个粒子选一个缓慢变化的目标点（稳定但不僵硬）
+    const tIndex = floor(map(noise(this.seed, frameCount*0.0022), 0, 1, 0, targets.length));
+    const t = targets[constrain(tIndex, 0, targets.length-1)];
+    const target = createVector(t.x, t.y).add(this.targetOffset);
+
+    const d = p5.Vector.sub(target, this.p);
+    const dist = max(1, d.mag());
+    d.normalize();
+
+    // pull/swirl 形成“被语言扰动的空气流”
+    // fast 组：更强 pull + 允许更高速度
+    // slow 组：更弱 pull，像慢慢靠拢
+    const pull  = d.mult((0.05 + 0.26*field) * this.gatherK);
+    const swirl = createVector(-d.y, d.x).mult((0.020 + 0.12*field) * this.gatherK);
+
+    // 距离衰减：远处也会被影响，但不会瞬移
+    const falloff = 1 / (1 + dist*0.010);
+
+    this.v.add(pull.mult(falloff*1.55));
+    this.v.add(swirl.mult(falloff*1.05));
+
+    // 输入时“颤动”：fast 更强，slow 更弱
+    const jitter = (this.group === "fast") ? (0.030 + 0.015*this.layer) : (0.012 + 0.010*this.layer);
+    this.v.add(random(-jitter,jitter)*field, random(-jitter,jitter)*field);
+
+    // 聚拢时速度上限：fast/slow 不同
+    this.v.limit(this.gatherSpeedLimit);
+  }
+
+  step(){
+    // 无互动时：所有粒子维持尘埃漫游（你现在的效果）
+    // 有互动时：fast/slow 额外聚拢，idle 继续原地漂与闪烁
+    this.idleDrift();
+    this.gatherToText();
+
+    this.p.add(this.v);
+
+    // 边界循环
+    if(this.p.x<0) this.p.x=width;
+    if(this.p.x>width) this.p.x=0;
+    if(this.p.y<0) this.p.y=height;
+    if(this.p.y>height) this.p.y=0;
+  }
+
+  flickerAlpha(){
+    // 输入时：所有粒子闪烁频率都会更快（包括 idle）
+    const rate = this.flickerRateBase + (0.055 * field);
+    const t = frameCount * rate;
+
+    const s = (sin(t*2*PI + this.flickerPhase) + 1) * 0.5;
+    const n = noise(this.seed + t*2.0, this.i*0.01);
+
+    const base = this.baseA0 + (this.baseA1 - this.baseA0) * n;
+
+    // pulse：输入时更亮；近景更强
+    const pulse = (26 + 175*field) * s * this.pulseK;
+
+    // sparkle：输入时出现更频繁；近景更容易闪点
+    const sparkleGate = (0.89 - 0.20*field) - (this.layer*0.02);
+    const sparkle = (16 + 155*field) * (n > sparkleGate ? 1 : 0) * this.pulseK;
+
+    // fast 组在互动时更“明显”（亮度稍抬）
+    const groupBoost = (this.group === "fast") ? (20*field) : (this.group === "slow" ? (8*field) : 0);
+
+    return constrain(base + pulse + sparkle + groupBoost, 0, 255);
+  }
+
+  show(){
+    const a = this.flickerAlpha();
+
+    // 尺寸：近景更大；互动时稍膨胀；fast 组更显眼一点点
+    const groupSizeBoost = (this.group === "fast") ? 0.55*field : (this.group === "slow" ? 0.25*field : 0);
+    const r = (this.r0 + (this.layer===2 ? 1.0 : this.layer===1 ? 0.6 : 0.3)) + 1.15*field + groupSizeBoost;
+
+    // 整体抬亮：让远景也可见，但仍克制
+    fill(255, min(255, a + 18 + this.layer*10));
+    circle(this.p.x, this.p.y, r);
+  }
+}
+</script>
+</body>
+</html>
